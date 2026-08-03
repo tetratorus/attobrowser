@@ -3,6 +3,7 @@
   "name": "attobrowser",
   "version": "0.1",
   "background": { "service_worker": "sw.js" },
+  "icons": { "128": "icon128.png" },
   "permissions": ["debugger", "tabs"],
   "host_permissions": ["<all_urls>"]
 }
