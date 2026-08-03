@@ -1,0 +1,77 @@
+#!/usr/bin/env node
+// attobrowser CLI + bridge. Raw CDP, no wrappers.
+//   atto serve                          run the bridge (once, in background)
+//   atto <method> ['<params-json>'] [tabId]
+// e.g. atto Page.navigate '{"url":"https://example.com"}'
+//      atto Page.captureScreenshot     (base64 auto-saved to file, path printed)
+//      atto tabs.list | atto tabs.new '{"url":"..."}'
+const PORT = 9333;
+
+if (process.argv[2] === "serve") {
+  const queue = [], pending = new Map();
+  let waiter = null;
+  require("http").createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.url === "/poll") {
+        // extension asking for work; hold up to 25s
+        const give = () => res.end(JSON.stringify(queue.shift()));
+        if (queue.length) give();
+        else {
+          waiter = give;
+          setTimeout(() => { if (waiter === give) { waiter = null; res.writeHead(204).end(); } }, 25e3);
+        }
+      } else if (req.url === "/result") {
+        const msg = JSON.parse(body);
+        pending.get(msg.id)?.(msg);
+        pending.delete(msg.id);
+        res.end();
+      } else if (req.url === "/cmd") {
+        const cmd = JSON.parse(body);
+        cmd.id = Math.random().toString(36).slice(2);
+        pending.set(cmd.id, (msg) => res.end(JSON.stringify(msg)));
+        queue.push(cmd);
+        if (waiter) { const w = waiter; waiter = null; w(); }
+      } else res.writeHead(404).end();
+    });
+  }).listen(PORT, () => console.log(`atto bridge on :${PORT}`));
+} else {
+  const [method, json, tab] = process.argv.slice(2);
+  if (!method) { console.error("usage: atto serve | atto <method> ['<params>'] [tabId]"); process.exit(1); }
+  const send = (method, params) =>
+    fetch(`http://localhost:${PORT}/cmd`, {
+      method: "POST",
+      body: JSON.stringify({ method, params, tabId: tab ? +tab : undefined }),
+      signal: AbortSignal.timeout(30e3),
+    }).then((r) => r.json());
+  // phantom cursor: self-installing overlay, glides to (x,y) before real input lands
+  const cursor = (x, y) => `((x,y)=>{let c=document.getElementById('atto-cur');if(!c){c=document.createElement('div');c.id='atto-cur';c.style.cssText='position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;transition:transform .15s';c.innerHTML='<svg width=20 height=26 viewBox="0 0 20 26"><path d="M0 0 L0 18 L4.5 14 L7.5 21.5 L11 20 L8 13 L14 13 Z" fill="#D97757" stroke="#fff" stroke-width="1.5"/></svg>';document.documentElement.appendChild(c)}c.style.transform='translate('+x+'px,'+y+'px)'})(${x},${y})`;
+  const vis = (on) => `document.getElementById('atto-cur')?.style.setProperty('display','${on ? "" : "none"}')`;
+  (async () => {
+    const params = json ? JSON.parse(json) : {};
+    if (method === "Input.dispatchMouseEvent" && params.x != null) {
+      await send("Runtime.evaluate", { expression: cursor(params.x, params.y) }).catch(() => {});
+      await new Promise((r) => setTimeout(r, 180)); // let it glide
+    }
+    if (method === "Page.captureScreenshot") await send("Runtime.evaluate", { expression: vis(false) }).catch(() => {});
+    const msg = await send(method, params);
+    if (method === "Page.captureScreenshot") await send("Runtime.evaluate", { expression: vis(true) }).catch(() => {});
+    {
+      if (msg.error) { console.error(msg.error); process.exit(1); }
+      // save any big base64 blob (screenshots etc.) to a file instead of flooding stdout
+      for (const [k, v] of Object.entries(msg.result ?? {}))
+        if (typeof v === "string" && v.length > 4096 && /^[A-Za-z0-9+/=]+$/.test(v)) {
+          const f = `/tmp/atto-${Date.now()}.${k === "data" ? "png" : "bin"}`;
+          require("fs").writeFileSync(f, Buffer.from(v, "base64"));
+          msg.result[k] = f;
+        }
+      console.log(JSON.stringify(msg.result, null, 1));
+    }
+  })().catch((e) => {
+    console.error(e.name === "TimeoutError"
+      ? "no reply from extension — is ext/ loaded in chrome://extensions?"
+      : "bridge not running — start it: atto serve");
+    process.exit(1);
+  });
+}

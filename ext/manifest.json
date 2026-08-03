@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "attobrowser",
+  "version": "0.1",
+  "background": { "service_worker": "sw.js" },
+  "permissions": ["debugger", "tabs"],
+  "host_permissions": ["<all_urls>"]
+}
