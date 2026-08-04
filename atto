@@ -49,6 +49,14 @@ if (process.argv[2] === "serve") {
   const cursor = (x, y) => `((x,y)=>{let c=document.getElementById('atto-cur');if(!c){c=document.createElement('div');c.id='atto-cur';c.style.cssText='position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;transition:transform .15s';c.innerHTML='<svg width=20 height=26 viewBox="0 0 20 26"><path d="M0 0 L0 18 L4.5 14 L7.5 21.5 L11 20 L8 13 L14 13 Z" fill="#D97757" stroke="#fff" stroke-width="1.5"/></svg>';document.documentElement.appendChild(c)}c.style.transform='translate('+x+'px,'+y+'px)'})(${x},${y})`;
   const vis = (on) => `document.getElementById('atto-cur')?.style.setProperty('display','${on ? "" : "none"}')`;
   (async () => {
+    // atto q ['regex'] [tabId] — visible interactive elements as "x,y <tag> text" lines, grep'd
+    if (method === "q") {
+      const expr = `[...document.querySelectorAll('a,button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=option],[role=checkbox],[contenteditable],[onclick]')].filter(e=>e.checkVisibility()).map(e=>{const r=e.getBoundingClientRect();return Math.round(r.x+r.width/2)+','+Math.round(r.y+r.height/2)+' <'+e.tagName.toLowerCase()+'> '+((e.innerText||e.value||e.placeholder||e.getAttribute('aria-label')||e.title||'').trim().replace(/\\s+/g,' ').slice(0,80))}).filter(l=>${JSON.stringify(json ?? "")}?new RegExp(${JSON.stringify(json ?? "")},'i').test(l):true).join('\\n')`;
+      const m = await send("Runtime.evaluate", { expression: expr, returnByValue: true });
+      if (m.error) { console.error(m.error); process.exit(1); }
+      console.log(m.result.result.value || "(no matches)");
+      return;
+    }
     const params = json ? JSON.parse(json) : {};
     if (method === "Input.dispatchMouseEvent" && params.x != null) {
       await send("Runtime.evaluate", { expression: cursor(params.x, params.y) }).catch(() => {});
