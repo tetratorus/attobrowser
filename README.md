@@ -1,6 +1,6 @@
 # attobrowser
 
-Raw Chrome DevTools Protocol access to your real, logged-in browser. 85 lines, zero dependencies.
+Raw Chrome DevTools Protocol access to your real, logged-in browser. 97 lines, zero dependencies.
 
 Built on a bet: models are smart. They know CDP, they can read [the protocol docs](https://chromedevtools.github.io/devtools-protocol/), and they don't need `click()` wrappers, element registries, or a bundled automation framework deciding what they're allowed to observe. Give them the pipe.
 
@@ -26,12 +26,14 @@ atto Page.navigate '{"url":"https://example.com"}' <tabId>
 atto Runtime.evaluate '{"expression":"document.title","returnByValue":true}' <tabId>
 atto Page.captureScreenshot '{}' <tabId>             # big base64 auto-saved, path printed
 atto q 'sign ?in' <tabId>                            # grep visible interactive elements
+atto click 128,396 <tabId>                           # coordinates straight from q
 ```
 
-Only three verbs aren't raw CDP:
+Only four verbs aren't raw CDP:
 
 - `tabs.list` / `tabs.new` — tab handles live outside CDP's reach from an extension
 - `q ['regex']` — dumps visible interactive elements as `x,y <tag> text` lines, filtered page-side by your regex. Empty pattern dumps all (~2KB for a dense page vs ~50KB of accessibility tree). This replaces both "read page" and "find element": you write the regex, you get coordinates, you click them.
+- `click x,y` — the one action common enough to earn a verb: moved/pressed/released in a single invocation, taking `q`'s coordinates verbatim.
 
 Mouse events get a phantom cursor for free — a fixed-position SVG that glides to (x,y) before the real input lands, self-installs on any page, and auto-hides during screenshots so the model never sees its own pointer. It's cosmetic; the input is real CDP.
 
@@ -42,10 +44,10 @@ No API for these — they're just CDP. Paste-adapt as needed.
 **Click** (coordinates from `q`):
 
 ```sh
-atto Input.dispatchMouseEvent '{"type":"mouseMoved","x":128,"y":396}' $TAB
-atto Input.dispatchMouseEvent '{"type":"mousePressed","x":128,"y":396,"button":"left","clickCount":1}' $TAB
-atto Input.dispatchMouseEvent '{"type":"mouseReleased","x":128,"y":396,"button":"left","clickCount":1}' $TAB
+atto click 128,396 $TAB
 ```
+
+Sugar for `Input.dispatchMouseEvent` moved/pressed/released at (x,y). Right-clicks, double-clicks, drags: dispatch the raw events yourself.
 
 **Type** — into the focused element (click it first):
 
@@ -92,6 +94,6 @@ Gotchas: `Runtime.evaluate` shares the page's global scope across calls — wrap
 
 ## Non-goals
 
-Element ref registries (state that goes stale), semantic element search (the calling model is the semantic engine — regex + retry is free), retry/wait logic (the model retries better than code: it re-reads the page first), per-action wrappers (`click()`, `type()` — condescension as API design).
+Element ref registries (state that goes stale), semantic element search (the calling model is the semantic engine — regex + retry is free), retry/wait logic (the model retries better than code: it re-reads the page first), per-action wrappers beyond `click` (typing, keys, scrolling are one CDP call each already — wrapping them adds names, not leverage).
 
 Prior art, for contrast: [nanobrowser](https://github.com/nanobrowser/nanobrowser) bundles puppeteer-core, a three-agent framework, and a 1,500-line DOM annotator into the same `chrome.debugger` foundation. Claude in Chrome curates ~30 tools over it, with an LLM subcall inside its `find`. attobrowser is the third point in that design space: the pipe, a cursor, and grep.

@@ -35,7 +35,7 @@ if (process.argv[2] === "serve") {
         if (waiter) { const w = waiter; waiter = null; w(); }
       } else res.writeHead(404).end();
     });
-  }).listen(PORT, () => console.log(`atto bridge on :${PORT}`));
+  }).listen(PORT, "127.0.0.1", () => console.log(`atto bridge on :${PORT}`));
 } else {
   const [method, json, tab] = process.argv.slice(2);
   if (!method) { console.error("usage: atto serve | atto <method> ['<params>'] [tabId]"); process.exit(1); }
@@ -55,6 +55,18 @@ if (process.argv[2] === "serve") {
       const m = await send("Runtime.evaluate", { expression: expr, returnByValue: true });
       if (m.error) { console.error(m.error); process.exit(1); }
       console.log(m.result.result.value || "(no matches)");
+      return;
+    }
+    // atto click x,y [tabId] — coordinates as printed by q
+    if (method === "click") {
+      const [x, y] = json.split(",").map(Number);
+      await send("Runtime.evaluate", { expression: cursor(x, y) }).catch(() => {});
+      await new Promise((r) => setTimeout(r, 180)); // let it glide
+      for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
+        const p = type === "mouseMoved" ? { type, x, y } : { type, x, y, button: "left", clickCount: 1 };
+        const m = await send("Input.dispatchMouseEvent", p);
+        if (m.error) { console.error(m.error); process.exit(1); }
+      }
       return;
     }
     const params = json ? JSON.parse(json) : {};
