@@ -1,6 +1,6 @@
 # attobrowser
 
-Raw Chrome DevTools Protocol access to your real, logged-in browser. 128 lines, zero dependencies.
+Raw Chrome DevTools Protocol access to your real, logged-in browser. 85 lines, zero dependencies.
 
 Built on a bet: models are smart. They know CDP, they can read [the protocol docs](https://chromedevtools.github.io/devtools-protocol/), and they don't need `click()` wrappers, element registries, or a bundled automation framework deciding what they're allowed to observe. Give them the pipe.
 
