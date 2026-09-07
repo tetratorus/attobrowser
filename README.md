@@ -1,99 +1,98 @@
 # attobrowser
 
-Raw Chrome DevTools Protocol access to your real, logged-in browser. 97 lines, zero dependencies.
-
-Built on a bet: models are smart. They know CDP, they can read [the protocol docs](https://chromedevtools.github.io/devtools-protocol/), and they don't need `click()` wrappers, element registries, or a bundled automation framework deciding what they're allowed to observe. Give them the pipe.
-
-```
-┌─────────┐  bash   ┌────────┐  long-poll  ┌───────────┐  chrome.debugger  ┌──────┐
-│  agent  │ ──────► │ bridge │ ◄────────── │ extension │ ────────────────► │ tabs │
-└─────────┘  atto   └────────┘   localhost └───────────┘        CDP        └──────┘
-```
+Raw Chrome DevTools Protocol access over WebSocket, with a persistent tab selection per working directory. No browser automation framework or element registry: actions are raw CDP methods.
 
 ## Setup
 
-1. `./atto serve` — start the bridge (localhost:9333)
-2. chrome://extensions → Developer mode → Load unpacked → `ext/`
-3. `./atto tabs.list` — if JSON comes back, you're live
+Requires Node.js and `npm install` in this repository. Chrome launch/stop is supported on macOS; connecting to an existing local CDP endpoint uses HTTP and WebSocket.
 
-## Usage
-
-Any CDP method, verbatim:
+Run the `atto` executable by absolute path from the directory doing the browsing. The examples below use `atto` as shorthand; the repository does not install a global command.
 
 ```sh
-atto tabs.new '{"url":"https://example.com"}'        # returns tab, note the id
-atto Page.navigate '{"url":"https://example.com"}' <tabId>
-atto Runtime.evaluate '{"expression":"document.title","returnByValue":true}' <tabId>
-atto Page.captureScreenshot '{}' <tabId>             # big base64 auto-saved, path printed
-atto q 'sign ?in' <tabId>                            # grep visible interactive elements
-atto click 128,396 <tabId>                           # coordinates straight from q
+atto state
+atto tabs
+atto attach TARGET_ID
+atto Runtime.evaluate '{"expression":"document.title","returnByValue":true}'
 ```
 
-Only four verbs aren't raw CDP:
+If Chrome is not already reachable with CDP, `atto start` launches it on port 9229 by default. **Starting can terminate an existing Chrome process and relaunch it; do not do this while others are using it without permission.** Raw commands do not automatically start Chrome.
 
-- `tabs.list` / `tabs.new` — tab handles live outside CDP's reach from an extension
-- `q ['regex']` — dumps visible interactive elements as `x,y <tag> text` lines, filtered page-side by your regex. Empty pattern dumps all (~2KB for a dense page vs ~50KB of accessibility tree). This replaces both "read page" and "find element": you write the regex, you get coordinates, you click them.
-- `click x,y` — the one action common enough to earn a verb: moved/pressed/released in a single invocation, taking `q`'s coordinates verbatim.
+The default launch profile is `~/.attobrowser-chrome`, not the normal Chrome profile. The launcher reads repository `config.json` or `~/.attobrowser/config.json`; its `chrome.userDataDir` setting can override the profile. See `lib/launch-chrome.js` for launcher configuration.
 
-Mouse events get a phantom cursor for free — a fixed-position SVG that glides to (x,y) before the real input lands, self-installs on any page, and auto-hides during screenshots so the model never sees its own pointer. It's cosmetic; the input is real CDP.
+## Commands
 
-## Recipes
+| Command | Behavior |
+| --- | --- |
+| `atto tabs [port]` | List page target IDs, titles, and URLs; does not select a tab. |
+| `atto attach <targetId> [port]` | Validate the tab connection and save its port and exact target ID. |
+| `atto state` | Show saved selection and live availability, title, and URL. |
+| `atto <Domain.method> [params-json]` | Send one raw CDP command to the saved target. |
+| `atto start [port] [--kill]` | Start or reuse Chrome with CDP; does not select a tab. |
+| `atto stop` | Terminate Chrome, not merely detach the client. |
 
-No API for these — they're just CDP. Paste-adapt as needed.
+For `tabs` and `attach`, port precedence is explicit argument, `ATTOBROWSER_PORT`, saved port, then 9229. For a custom-port launch, pass the port to the initial `tabs` and `attach` commands. `state` and raw CDP commands always use the saved port, even if the environment changes.
 
-**Click** (coordinates from `q`):
+## Directory-scoped state
+
+`atto attach` atomically writes `attobrowser-state.json` in the **caller's current working directory**, not in the executable's directory:
+
+```json
+{
+  "port": 9229,
+  "targetId": "ABC123"
+}
+```
+
+Run all commands for a task from the same directory. There is no parent-directory search. Different directories have independent selections; two agents in the same directory share the selection. Keep the state file out of version control; this repository ignores it, but other caller repositories need their own ignore rule.
+
+Foreground focus, tab ordering, and navigation do not change the selection. `atto attach <otherTargetId>` is the explicit way to switch. New tabs and popups are not selected automatically. Commands never fall back to the first tab or a URL match.
+
+`atto state` prints JSON with `stateFile`, the saved `port` and `targetId` when present, and one of these statuses:
+
+- `not attached`: no state file exists.
+- `available`: Chrome lists the selected page target; live `title` and `url` are included. This does not mean a CDP socket is held open or the page has finished loading.
+- `target missing`: Chrome is reachable, but the selected tab no longer exists.
+- `browser unreachable`: the saved CDP port cannot be queried.
+
+State inspection does not modify the selection. Missing targets and unreachable browsers cause raw commands to fail. Malformed state also fails closed; an explicit `atto attach <targetId> <port>` can replace it after validating the intended tab. A browser restart can invalidate saved IDs.
+
+The state file persists **tab identity**, not a live CDP session. One-shot invocations open and close their own sockets; session-scoped settings do not persist between them. Browser/page state itself remains in Chrome.
+
+## Persistent sessions
+
+`atto session` opens one connection to the saved target and accepts newline-delimited JSON on stdin:
+
+```json
+{"method":"Runtime.evaluate","params":{"expression":"document.title","returnByValue":true}}
+{"method":"Page.captureScreenshot"}
+```
+
+The first output line reports `status: "connected"`, the state-file path, port, and target ID. Each command produces one JSON line containing `result` or `error`, in order. Screenshot output remains a file path. Invalid commands are reported without ending the session. EOF disconnects without stopping Chrome. There are no automatic retries or reconnects, and CDP events are not output.
+
+The session stays pinned to its original target, even if another process changes the state file. End it before deliberately attaching to a different tab. `atto state` still reports the saved directory selection, not a registry of live connections.
+
+For background input that stalls (observed with wheel events in Chrome), use the same session to send `Emulation.setFocusEmulationEnabled` with `{"enabled":true}`, move the pointer to freshly observed coordinates, send input, capture a screenshot, and verify the actual UI change/scroll offset. Then send the emulation command with `{"enabled":false}`. Focus emulation temporarily changes page focus/visibility APIs without selecting the foreground tab. Keep it enabled until the expected change is observed; separate one-shot calls lose this setting when their sockets close.
+
+## Interactive workflow
+
+Observe, act, wait for a relevant condition, then observe again. When asked to inspect the current page, do not navigate or reload it first.
 
 ```sh
-atto click 128,396 $TAB
+atto Runtime.evaluate '{"expression":"({url:location.href,title:document.title,readyState:document.readyState})","returnByValue":true}'
+atto Runtime.evaluate '{"expression":"document.body?.innerText.slice(0,5000)","returnByValue":true}'
+atto Page.captureScreenshot
 ```
 
-Sugar for `Input.dispatchMouseEvent` moved/pressed/released at (x,y). Right-clicks, double-clicks, drags: dispatch the raw events yourself.
+Large base64 result fields are saved to temporary files and their paths printed instead. Read screenshot files to inspect the page visually.
 
-**Type** — into the focused element (click it first):
+Navigation uses `Page.navigate`; typing uses `Input.insertText`; clicking, keys, and scrolling use raw `Input` events. Verify the intended destination and a page-specific condition after navigation: the navigation response is not proof of readiness, and `document.readyState` alone can describe the old document or miss SPA updates.
 
-```sh
-atto Input.insertText '{"text":"hello world"}' $TAB
-```
+Refresh observations and coordinates after navigation, scrolling, or layout changes. Discard document-bound handles after navigation. Wrap evaluated code in an IIFE to avoid conflicting global bindings. Other users can operate different tabs without redirecting commands, but changes to the same tab are not isolated.
 
-Real keystrokes (for pages with key handlers): `Input.dispatchKeyEvent` with `keyDown`/`keyUp`, or press Enter:
+Background tabs can have populated DOM nodes but empty `innerText` because rendering is skipped (`content-visibility: auto`, observed in Drive). Capture a screenshot of the pinned tab, then re-read the text; this refreshed the visible rows without bringing Drive to the foreground. Scoped `textContent` or accessibility labels can help inspect the DOM, but may include hidden controls. Check the intended URL and actual content, not only `readyState`, row count, or default `checkVisibility()`. Do not steal foreground focus or repeat a navigation just because the first observation is incomplete.
 
-```sh
-atto Input.dispatchKeyEvent '{"type":"keyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13,"text":"\r"}' $TAB
-atto Input.dispatchKeyEvent '{"type":"keyUp","key":"Enter","code":"Enter","windowsVirtualKeyCode":13}' $TAB
-```
+Timeouts and disconnections do not trigger retries or tab reselection. A command may have taken effect before the connection failed; inspect before retrying a click or submission. Do not use `atto stop` as routine cleanup: commands already close their own connections and leave Chrome running.
 
-**Scroll**:
+## Verification
 
-```sh
-atto Input.dispatchMouseEvent '{"type":"mouseWheel","x":400,"y":400,"deltaY":600}' $TAB
-```
-
-**Page text** (the reading-an-article case):
-
-```sh
-atto Runtime.evaluate '{"expression":"document.body.innerText.slice(0,5000)","returnByValue":true}' $TAB
-```
-
-**Wait** — don't sleep and hope; poll the condition. Soft navigations (GitHub, SPAs) commit the URL late:
-
-```sh
-atto Runtime.evaluate '{"expression":"location.href+\" \"+document.readyState","returnByValue":true}' $TAB
-```
-
-**Debug a click that "didn't work"** — instrument the page, dispatch, read back:
-
-```sh
-atto Runtime.evaluate '{"expression":"window.__ev=[];[\"pointerdown\",\"click\"].forEach(t=>addEventListener(t,e=>__ev.push(t+\"@\"+e.clientX+\",\"+e.clientY+\" on \"+e.target.tagName),{capture:true}));0","returnByValue":true}' $TAB
-# ...dispatch the click, then:
-atto Runtime.evaluate '{"expression":"window.__ev.join(\"; \")","returnByValue":true}' $TAB
-```
-
-**Everything else**: cookies (`Network.getCookies`), request interception (`Fetch.enable`), device emulation (`Emulation.*`), init scripts (`Page.addScriptToEvaluateOnNewDocument`), PDF export (`Page.printToPDF`) — it's all just there. If CDP can do it, atto can do it, because atto *is* CDP.
-
-Gotchas: `Runtime.evaluate` shares the page's global scope across calls — wrap in an IIFE or you'll hit `Identifier 'x' has already been declared`. Coordinates from `q` go stale after navigation — re-run `q`. The "attobrowser started debugging this browser" infobar is Chrome's `chrome.debugger` notice; Cancel detaches, the next command re-attaches.
-
-## Non-goals
-
-Element ref registries (state that goes stale), semantic element search (the calling model is the semantic engine — regex + retry is free), retry/wait logic (the model retries better than code: it re-reads the page first), per-action wrappers beyond `click` (typing, keys, scrolling are one CDP call each already — wrapping them adds names, not leverage).
-
-Prior art, for contrast: [nanobrowser](https://github.com/nanobrowser/nanobrowser) bundles puppeteer-core, a three-agent framework, and a 1,500-line DOM annotator into the same `chrome.debugger` foundation. Claude in Chrome curates ~30 tools over it, with an LLM subcall inside its `find`. attobrowser is the third point in that design space: the pipe, a cursor, and grep.
+Run `npm test`. Tests use Node's built-in test runner and a local mock CDP server with temporary caller directories; they do not launch or touch Chrome.

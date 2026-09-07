@@ -1,0 +1,26 @@
+{
+  "name": "attobrowser",
+  "version": "1.0.0",
+  "description": "Raw Chrome DevTools Protocol access over WebSocket, with a persistent tab selection per working directory.",
+  "main": "index.js",
+  "directories": {
+    "lib": "lib"
+  },
+  "scripts": {
+    "test": "node --test atto.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tetratorus/attobrowser.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/tetratorus/attobrowser/issues"
+  },
+  "homepage": "https://github.com/tetratorus/attobrowser#readme",
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}

@@ -1,97 +1,151 @@
 #!/usr/bin/env node
-// attobrowser CLI + bridge. Raw CDP, no wrappers.
-//   atto serve                          run the bridge (once, in background)
-//   atto <method> ['<params-json>'] [tabId]
-// e.g. atto Page.navigate '{"url":"https://example.com"}'
-//      atto Page.captureScreenshot     (base64 auto-saved to file, path printed)
-//      atto tabs.list | atto tabs.new '{"url":"..."}'
-const PORT = 9333;
+// attobrowser CLI. Raw CDP over WS.
+//   atto start [port] [--kill]
+//   atto stop
+//   atto <Domain.method> [params-json]
+const fs = require("fs");
+const readline = require("readline");
+const launch = require("./lib/launch-chrome");
+const cdp = require("./lib/cdp");
+const state = require("./lib/state");
 
-if (process.argv[2] === "serve") {
-  const queue = [], pending = new Map();
-  let waiter = null;
-  require("http").createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => (body += c));
-    req.on("end", () => {
-      if (req.url === "/poll") {
-        // extension asking for work; hold up to 25s
-        const give = () => res.end(JSON.stringify(queue.shift()));
-        if (queue.length) give();
-        else {
-          waiter = give;
-          setTimeout(() => { if (waiter === give) { waiter = null; res.writeHead(204).end(); } }, 25e3);
-        }
-      } else if (req.url === "/result") {
-        const msg = JSON.parse(body);
-        pending.get(msg.id)?.(msg);
-        pending.delete(msg.id);
-        res.end();
-      } else if (req.url === "/cmd") {
-        const cmd = JSON.parse(body);
-        cmd.id = Math.random().toString(36).slice(2);
-        pending.set(cmd.id, (msg) => res.end(JSON.stringify(msg)));
-        queue.push(cmd);
-        if (waiter) { const w = waiter; waiter = null; w(); }
-      } else res.writeHead(404).end();
-    });
-  }).listen(PORT, "127.0.0.1", () => console.log(`atto bridge on :${PORT}`));
-} else {
-  const [method, json, tab] = process.argv.slice(2);
-  if (!method) { console.error("usage: atto serve | atto <method> ['<params>'] [tabId]"); process.exit(1); }
-  const send = (method, params) =>
-    fetch(`http://localhost:${PORT}/cmd`, {
-      method: "POST",
-      body: JSON.stringify({ method, params, tabId: tab ? +tab : undefined }),
-      signal: AbortSignal.timeout(30e3),
-    }).then((r) => r.json());
-  // phantom cursor: self-installing overlay, glides to (x,y) before real input lands
-  const cursor = (x, y) => `((x,y)=>{let c=document.getElementById('atto-cur');if(!c){c=document.createElement('div');c.id='atto-cur';c.style.cssText='position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;transition:transform .15s';c.innerHTML='<svg width=20 height=26 viewBox="0 0 20 26"><path d="M0 0 L0 18 L4.5 14 L7.5 21.5 L11 20 L8 13 L14 13 Z" fill="#D97757" stroke="#fff" stroke-width="1.5"/></svg>';document.documentElement.appendChild(c)}c.style.transform='translate('+x+'px,'+y+'px)'})(${x},${y})`;
-  const vis = (on) => `document.getElementById('atto-cur')?.style.setProperty('display','${on ? "" : "none"}')`;
-  (async () => {
-    // atto q ['regex'] [tabId] — visible interactive elements as "x,y <tag> text" lines, grep'd
-    if (method === "q") {
-      const expr = `[...document.querySelectorAll('a,button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=option],[role=checkbox],[contenteditable],[onclick]')].filter(e=>e.checkVisibility()).map(e=>{const r=e.getBoundingClientRect();return Math.round(r.x+r.width/2)+','+Math.round(r.y+r.height/2)+' <'+e.tagName.toLowerCase()+'> '+((e.innerText||e.value||e.placeholder||e.getAttribute('aria-label')||e.title||'').trim().replace(/\\s+/g,' ').slice(0,80))}).filter(l=>${JSON.stringify(json ?? "")}?new RegExp(${JSON.stringify(json ?? "")},'i').test(l):true).join('\\n')`;
-      const m = await send("Runtime.evaluate", { expression: expr, returnByValue: true });
-      if (m.error) { console.error(m.error); process.exit(1); }
-      console.log(m.result.result.value || "(no matches)");
-      return;
-    }
-    // atto click x,y [tabId] — coordinates as printed by q
-    if (method === "click") {
-      const [x, y] = json.split(",").map(Number);
-      await send("Runtime.evaluate", { expression: cursor(x, y) }).catch(() => {});
-      await new Promise((r) => setTimeout(r, 180)); // let it glide
-      for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
-        const p = type === "mouseMoved" ? { type, x, y } : { type, x, y, button: "left", clickCount: 1 };
-        const m = await send("Input.dispatchMouseEvent", p);
-        if (m.error) { console.error(m.error); process.exit(1); }
-      }
-      return;
-    }
-    const params = json ? JSON.parse(json) : {};
-    if (method === "Input.dispatchMouseEvent" && params.x != null) {
-      await send("Runtime.evaluate", { expression: cursor(params.x, params.y) }).catch(() => {});
-      await new Promise((r) => setTimeout(r, 180)); // let it glide
-    }
-    if (method === "Page.captureScreenshot") await send("Runtime.evaluate", { expression: vis(false) }).catch(() => {});
-    const msg = await send(method, params);
-    if (method === "Page.captureScreenshot") await send("Runtime.evaluate", { expression: vis(true) }).catch(() => {});
-    {
-      if (msg.error) { console.error(msg.error); process.exit(1); }
-      // save any big base64 blob (screenshots etc.) to a file instead of flooding stdout
-      for (const [k, v] of Object.entries(msg.result ?? {}))
-        if (typeof v === "string" && v.length > 4096 && /^[A-Za-z0-9+/=]+$/.test(v)) {
-          const f = `/tmp/atto-${Date.now()}.${k === "data" ? "png" : "bin"}`;
-          require("fs").writeFileSync(f, Buffer.from(v, "base64"));
-          msg.result[k] = f;
-        }
-      console.log(JSON.stringify(msg.result, null, 1));
-    }
-  })().catch((e) => {
-    console.error(e.name === "TimeoutError"
-      ? "no reply from extension — is ext/ loaded in chrome://extensions?"
-      : "bridge not running — start it: atto serve");
-    process.exit(1);
-  });
+const DEFAULT_PORT = 9229;
+const METHOD = /^[A-Za-z]+\.[A-Za-z]+$/;
+
+function getPort(explicit) {
+  const port = Number(explicit ?? process.env.ATTOBROWSER_PORT ?? state.load()?.port ?? DEFAULT_PORT);
+  if (!state.validPort(port)) throw new Error("port must be an integer from 1 to 65535");
+  return port;
 }
+
+async function listTargets(port) {
+  try {
+    return await launch.listTargets(port, 2000);
+  } catch {
+    throw new Error(`Chrome not reachable on port ${port}. Run: atto start ${port}`);
+  }
+}
+
+function findTarget(targets, targetId) {
+  const target = targets.find((t) => t.type === "page" && t.id === targetId);
+  if (!target) throw new Error(`Target ${targetId} missing. Run: atto tabs, then atto attach <targetId>`);
+  return target;
+}
+
+function print(value) {
+  console.log(JSON.stringify(value, null, 2));
+}
+
+async function send(client, method, params = {}) {
+  if (typeof method !== "string" || !METHOD.test(method)) throw new Error("method must be Domain.method");
+  const res = await client.send(method, params);
+  if (res && typeof res === "object") {
+    for (const [k, v] of Object.entries(res)) {
+      if (typeof v === "string" && v.length > 4096 && /^[A-Za-z0-9+/=]+$/.test(v)) {
+        const f = `/tmp/atto-${Date.now()}.${k === "data" ? "png" : "bin"}`;
+        fs.writeFileSync(f, Buffer.from(v, "base64"));
+        res[k] = f;
+      }
+    }
+  }
+  return res;
+}
+
+async function runSession(client, saved) {
+  const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  console.log(JSON.stringify({ status: "connected", stateFile: state.statePath(), ...saved }));
+  for await (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const { method, params } = JSON.parse(line);
+      console.log(JSON.stringify({ result: await send(client, method, params) }));
+    } catch (error) {
+      console.log(JSON.stringify({ error: error.message }));
+    }
+  }
+}
+
+async function showState() {
+  const saved = state.load();
+  const result = { stateFile: state.statePath(), ...saved };
+  if (!saved) return print({ ...result, status: "not attached" });
+  let targets;
+  try {
+    targets = await listTargets(saved.port);
+  } catch {
+    return print({ ...result, status: "browser unreachable" });
+  }
+  const target = targets.find((t) => t.type === "page" && t.id === saved.targetId);
+  print(target
+    ? { ...result, status: "available", title: target.title, url: target.url }
+    : { ...result, status: "target missing" });
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const cmd = args[0];
+
+  if (cmd === "start") {
+    let port;
+    let kill = false;
+    for (const a of args.slice(1)) {
+      if (/^\d+$/.test(a)) port = parseInt(a, 10);
+      else if (a === "--kill" || a === "kill") kill = true;
+    }
+    const res = await launch.start({ port, kill });
+    console.log(`port=${res.port} started=${res.started}`);
+    return;
+  }
+
+  if (cmd === "stop") {
+    await launch.stop();
+    return;
+  }
+
+  if (cmd === "state") {
+    if (args.length !== 1) throw new Error("usage: atto state");
+    return showState();
+  }
+
+  if (cmd === "tabs") {
+    if (args.length > 2) throw new Error("usage: atto tabs [port]");
+    const targets = await listTargets(getPort(args[1]));
+    return print(targets.filter((t) => t.type === "page").map(({ id, title, url }) => ({ id, title, url })));
+  }
+
+  if (cmd === "attach") {
+    if (!args[1] || args.length > 3) throw new Error("usage: atto attach <targetId> [port]");
+    const port = getPort(args[2]);
+    const target = findTarget(await listTargets(port), args[1]);
+    const client = await cdp.connect(target.webSocketDebuggerUrl);
+    client.close();
+    const saved = { port, targetId: target.id };
+    state.save(saved);
+    return print({ stateFile: state.statePath(), ...saved });
+  }
+
+  if (!cmd) {
+    throw new Error("usage: atto start [port] [--kill] | stop | tabs [port] | attach <targetId> [port] | state | session | <Domain.method> [params-json]");
+  }
+
+  if (cmd === "session" ? args.length !== 1 : !METHOD.test(cmd) || args.length > 2) {
+    throw new Error("usage: atto session | atto <Domain.method> [params-json]");
+  }
+
+  const params = args[1] ? JSON.parse(args[1]) : {};
+  const saved = state.load();
+  if (!saved) throw new Error(`No tab attached in ${state.statePath()}. Run: atto tabs, then atto attach <targetId>`);
+  const target = findTarget(await listTargets(saved.port), saved.targetId);
+  const client = await cdp.connect(target.webSocketDebuggerUrl);
+  try {
+    if (cmd === "session") await runSession(client, saved);
+    else console.log(JSON.stringify(await send(client, cmd, params), null, 1));
+  } finally {
+    client.close();
+  }
+}
+
+main().catch((e) => {
+  console.error(e.message);
+  process.exit(1);
+});

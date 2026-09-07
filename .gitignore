@@ -1,1 +1,4 @@
 attobrowser.zip
+attobrowser-state.json
+attobrowser-state.json.*.tmp
+node_modules/
