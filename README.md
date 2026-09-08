@@ -96,3 +96,7 @@ Timeouts and disconnections do not trigger retries or tab reselection. A command
 ## Verification
 
 Run `npm test`. Tests use Node's built-in test runner and a local mock CDP server with temporary caller directories; they do not launch or touch Chrome.
+
+`node --test patch.test.js` checks the separate `cdpkit-chrome-driver.patch`
+artifact using isolated DOM/transport fixtures. It does not apply that patch or
+launch Chrome; the patch remains separate from the raw-CDP implementation here.

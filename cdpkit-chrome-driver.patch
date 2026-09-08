@@ -1,0 +1,1577 @@
+From 4baaa8b0a6c228ca01ee6a3d30a87e7e54eb1d1d Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 05:57:12 +0000
+Subject: [PATCH] chrome: accessibility snapshot, descriptor locators, trusted
+ input, waits, tabs, Linux support
+
+Co-Authored-By: Leonard Tan <lentan1029@gmail.com>
+---
+ README.md               |  15 +-
+ apps.js                 |  72 +++++--
+ dom.js                  | 437 ++++++++++++++++++++++++++++++++++++++++
+ drivers/chrome.js       | 131 ++++++++++--
+ observation.js          |  12 +-
+ package.json            |   2 +-
+ primitives.js           | 347 +++++++++++++++++++++++++++++--
+ session.js              |  79 +++++++-
+ test/chrome.test.js     | 140 +++++++++++++
+ test/fixtures/form.html |  92 +++++++++
+ 10 files changed, 1266 insertions(+), 61 deletions(-)
+ create mode 100644 dom.js
+ create mode 100644 test/chrome.test.js
+ create mode 100644 test/fixtures/form.html
+
+diff --git a/README.md b/README.md
+index c2a5816..323eef6 100644
+--- a/README.md
++++ b/README.md
+@@ -18,7 +18,7 @@ const slack = require("./drivers/slack");
+ 
+ ## Drivers
+ 
+-- `drivers/chrome.js` — browser navigation, screenshots, runtime evaluation
++- `drivers/chrome.js` — browser navigation, accessibility snapshot, locator-based click/type/select, waits, tabs, screenshots
+ - `drivers/slack.js` — in-app Slack API calls, messages, search, context
+ - `drivers/notion.js` — in-app Notion API calls, page open, text extract, search, context
+ 
+@@ -26,7 +26,8 @@ const slack = require("./drivers/slack");
+ 
+ - `transport.js` — CDP connection and raw domain calls
+ - `session.js` — launch, attach, and stop apps
+-- `primitives.js` — common CDP primitives (`eval`, `getText`, `captureScreenshot`, `waitFor`)
++- `primitives.js` — common CDP primitives (`eval`, `getText`, `captureScreenshot`, `waitFor`, locators, real input events)
++- `dom.js` — page-side helpers (roles, accessible names, refs, live regions) evaluated inside the target
+ - `observation.js` — network and event observation helpers
+ 
+ ## Security
+@@ -64,6 +65,16 @@ cdpkit is read-only by default. Never send, post, edit, or mutate state in any a
+ - Use `Page.getLayoutMetrics().cssLayoutViewport` and `cssContentSize` for screenshot clips so Retina displays capture correctly.
+ - Combine the screenshot with read methods (`getMessages`, `searchMessages`, `getText`, `search`) to answer user questions.
+ 
++### Chrome
++
++- `chrome.getContext(client)` returns `{ url, title, visibleText, interactables, alerts, screenshot }`. `interactables` is an accessibility-style list of visible controls (`{ ref, role, name, value, checked, disabled, expanded, selector }`); `alerts` surfaces live regions (`role=alert`/`aria-live`) and invalid fields (`aria-invalid`, `:user-invalid`) so validation errors are visible without a screenshot.
++- Every action takes a **locator**: a CSS selector string, a ref from the snapshot (`"@e12"`), or a descriptor such as `{ role: "button", text: "Next" }`, `{ label: "First name" }`, `{ placeholder: "Search" }`. Descriptors are matched against visible elements only unless `visible: false`; add `index` to disambiguate.
++- `click(client, locator)` scrolls into view and dispatches real mouse events via `Input.dispatchMouseEvent`, falling back to `el.click()` when the point is covered (pass `{ js: true }` to force). `type(client, locator, text)` focuses and uses `Input.insertText`, so React-style controlled inputs see trusted events. `select(client, locator, option)` handles native `<select>` and ARIA combobox/listbox widgets. `press(client, "Enter")` sends key combos (`"Control+a"`, `"Escape"`, `"Tab"`).
++- Actions settle by default: they wait until the DOM has been quiet for ~400ms. For explicit transitions prefer `waitForUrl`, `waitForText`, or `waitForElement` over sleeps; `waitForStable` is available on its own.
++- Tabs: `tabs(s)`, `switchTab(s, (t) => t.url.includes(...))`, `newTab(s, url)`, `closeTab(s, targetId)`. `switchTab` rebinds `s.client` to the chosen target.
++- Screenshots: `captureScreenshot(client, { fullPage: true, path })` writes to disk and returns the path instead of a base64 payload; `getContext(client, { screenshotPath })` does the same.
++- Linux is supported: Chrome is discovered on `PATH` (`google-chrome`, `chromium`, …) or via `CDPKIT_CHROME`.
++
+ ### Slack
+ 
+ - Prefer the cdpkit helpers; they call the in-app Slack APIs directly. Do not rely on the stale redux cache.
+diff --git a/apps.js b/apps.js
+index 5113e0e..3434007 100644
+--- a/apps.js
++++ b/apps.js
+@@ -1,38 +1,84 @@
+ const os = require("os");
++const fs = require("fs");
++const path = require("path");
+ 
+ const home = os.homedir();
+ const chromeProfile = `${home}/.cdpkit-chrome`;
++const isMac = process.platform === "darwin";
++const isLinux = process.platform === "linux";
++
++const LINUX_CHROME_BINARIES = [
++  "google-chrome",
++  "google-chrome-stable",
++  "chromium",
++  "chromium-browser",
++  "chrome",
++];
++
++function findOnPath(names) {
++  const dirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
++  for (const name of names) {
++    if (name.includes("/")) {
++      if (fs.existsSync(name)) return name;
++      continue;
++    }
++    for (const dir of dirs) {
++      const candidate = path.join(dir, name);
++      try {
++        fs.accessSync(candidate, fs.constants.X_OK);
++        return candidate;
++      } catch {
++        // keep looking
++      }
++    }
++  }
++  return null;
++}
++
++function chromeBinary() {
++  if (process.env.CDPKIT_CHROME) return process.env.CDPKIT_CHROME;
++  if (isMac) return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
++  if (isLinux) return findOnPath(LINUX_CHROME_BINARIES);
++  return null;
++}
++
++const chromeArgs = (port) => [
++  `--user-data-dir=${chromeProfile}`,
++  `--remote-debugging-port=${port}`,
++  "--no-first-run",
++  "--no-default-browser-check",
++];
+ 
+ const apps = {
+   chrome: {
+     name: "Google Chrome",
+-    processName: "Google Chrome",
+-    launchArgs: (port) => [
+-      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+-      `--user-data-dir=${chromeProfile}`,
+-      `--remote-debugging-port=${port}`,
+-      "--no-first-run",
+-      "--no-default-browser-check",
+-    ],
+-    killCmd:
+-      'killall -TERM "Google Chrome" 2>/dev/null; killall -TERM "Google Chrome Helper" 2>/dev/null; sleep 1; killall -9 "Google Chrome" 2>/dev/null; killall -9 "Google Chrome Helper" 2>/dev/null',
++    processName: isMac ? "Google Chrome" : undefined,
++    // Only match the cdpkit-owned profile so we never kill the user's own browser.
++    processPattern: isMac ? undefined : `--user-data-dir=${chromeProfile}`,
++    launchArgs: (port) => {
++      const bin = chromeBinary();
++      return bin ? [bin, ...chromeArgs(port)] : null;
++    },
++    killCmd: isMac
++      ? 'killall -TERM "Google Chrome" 2>/dev/null; killall -TERM "Google Chrome Helper" 2>/dev/null; sleep 1; killall -9 "Google Chrome" 2>/dev/null; killall -9 "Google Chrome Helper" 2>/dev/null'
++      : `pkill -TERM -f -- "--user-data-dir=${chromeProfile}" 2>/dev/null; sleep 1; pkill -9 -f -- "--user-data-dir=${chromeProfile}" 2>/dev/null`,
+     defaultPort: 9229,
+   },
+   slack: {
+     name: "Slack",
+     processName: "Slack",
+-    launchArgs: (port) => ["open", "-a", "Slack", "--args", `--remote-debugging-port=${port}`],
++    launchArgs: (port) => (isMac ? ["open", "-a", "Slack", "--args", `--remote-debugging-port=${port}`] : null),
+     killCmd: 'killall -TERM Slack 2>/dev/null; killall -9 Slack 2>/dev/null',
+     defaultPort: 9228,
+   },
+   notion: {
+     name: "Notion",
+     processName: "Notion",
+-    launchArgs: (port) => ["open", "-a", "Notion", "--args", `--remote-debugging-port=${port}`],
++    launchArgs: (port) => (isMac ? ["open", "-a", "Notion", "--args", `--remote-debugging-port=${port}`] : null),
+     killCmd:
+       'killall -TERM Notion 2>/dev/null; killall -TERM "Notion Helper" 2>/dev/null; sleep 1; killall -9 Notion 2>/dev/null; killall -9 "Notion Helper" 2>/dev/null',
+     defaultPort: 9230,
+   },
+ };
+ 
+-module.exports = { apps };
++module.exports = { apps, chromeProfile, chromeBinary };
+diff --git a/dom.js b/dom.js
+new file mode 100644
+index 0000000..8ea4ba0
+--- /dev/null
++++ b/dom.js
+@@ -0,0 +1,437 @@
++// Page-side DOM helpers. `pageHelpers` is serialized with `.toString()` and
++// evaluated inside the target page, so it must be self-contained: no closures
++// over Node scope, no `require`.
++
++function pageHelpers() {
++  const INTERACTIVE =
++    'a[href], button, input, select, textarea, summary, [role], [contenteditable=""], [contenteditable="true"], [tabindex]:not([tabindex="-1"]), [onclick]';
++  const CONTROLS =
++    'a[href], button, input, select, textarea, [contenteditable=""], [contenteditable="true"], [role="button"], [role="link"], [role="textbox"], [role="combobox"], [role="listbox"], [role="checkbox"], [role="radio"], [role="switch"], [role="tab"], [role="menuitem"], [role="option"], [role="slider"], [role="spinbutton"]';
++  const SKIP_ROLES = new Set([
++    "presentation",
++    "none",
++    "list",
++    "listbox",
++    "menu",
++    "menubar",
++    "radiogroup",
++    "group",
++    "tablist",
++    "toolbar",
++    "tree",
++    "grid",
++    "table",
++    "row",
++    "rowgroup",
++    "region",
++    "main",
++    "navigation",
++    "banner",
++    "contentinfo",
++    "complementary",
++    "form",
++    "dialog",
++    "alertdialog",
++    "alert",
++    "status",
++    "log",
++    "tooltip",
++    "img",
++    "heading",
++    "paragraph",
++    "separator",
++    "generic",
++    "document",
++    "application",
++    "article",
++  ]);
++  const TEXT_INPUT_TYPES = new Set([
++    "text",
++    "email",
++    "password",
++    "search",
++    "tel",
++    "url",
++    "number",
++    "date",
++    "datetime-local",
++    "month",
++    "week",
++    "time",
++  ]);
++
++  const refs = (window.__cdpkit = window.__cdpkit || { refs: {}, nextRef: 1 });
++
++  function norm(s) {
++    return (s || "").replace(/\s+/g, " ").trim();
++  }
++
++  function isVisible(el) {
++    if (!el || !(el instanceof Element)) return false;
++    if (el.closest('[aria-hidden="true"]')) return false;
++    if (typeof el.checkVisibility === "function") {
++      if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false;
++    } else {
++      const cs = getComputedStyle(el);
++      if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") return false;
++    }
++    const r = el.getBoundingClientRect();
++    if (r.width === 0 && r.height === 0) {
++      // Zero-size inputs (e.g. visually hidden checkboxes) may still have a clickable label.
++      return el.tagName === "INPUT" && !!el.labels && el.labels.length > 0;
++    }
++    return true;
++  }
++
++  function roleOf(el) {
++    const explicit = el.getAttribute("role");
++    if (explicit) return explicit.split(/\s+/)[0];
++    const tag = el.tagName;
++    if (tag === "A") return el.hasAttribute("href") ? "link" : "generic";
++    if (tag === "BUTTON" || tag === "SUMMARY") return "button";
++    if (tag === "SELECT") return el.multiple || el.size > 1 ? "listbox" : "combobox";
++    if (tag === "TEXTAREA") return "textbox";
++    if (tag === "OPTION") return "option";
++    if (tag === "INPUT") {
++      const t = (el.type || "text").toLowerCase();
++      if (t === "checkbox") return "checkbox";
++      if (t === "radio") return "radio";
++      if (t === "button" || t === "submit" || t === "reset" || t === "image") return "button";
++      if (t === "range") return "slider";
++      if (t === "file") return "button";
++      if (t === "hidden") return "hidden";
++      if (t === "search") return "searchbox";
++      return "textbox";
++    }
++    if (el.isContentEditable) return "textbox";
++    return "generic";
++  }
++
++  function textOf(el) {
++    return norm(el.innerText != null ? el.innerText : el.textContent);
++  }
++
++  function labelledBy(el) {
++    const ids = el.getAttribute("aria-labelledby");
++    if (!ids) return "";
++    return norm(
++      ids
++        .split(/\s+/)
++        .map((id) => {
++          const n = document.getElementById(id);
++          return n ? n.innerText || n.textContent : "";
++        })
++        .join(" ")
++    );
++  }
++
++  function nameOf(el) {
++    const aria = norm(el.getAttribute("aria-label"));
++    if (aria) return aria;
++    const lb = labelledBy(el);
++    if (lb) return lb;
++    if (el.labels && el.labels.length) {
++      const t = norm([...el.labels].map((l) => l.innerText || l.textContent).join(" "));
++      if (t) return t;
++    }
++    const wrappingLabel = el.closest("label");
++    if (wrappingLabel) {
++      const t = textOf(wrappingLabel);
++      if (t) return t;
++    }
++    const tag = el.tagName;
++    if (tag === "INPUT" || tag === "TEXTAREA") {
++      const ph = norm(el.getAttribute("placeholder"));
++      if (ph) return ph;
++      const t = (el.type || "").toLowerCase();
++      if ((t === "submit" || t === "button" || t === "reset") && el.value) return norm(el.value);
++    }
++    if (tag === "IMG") return norm(el.getAttribute("alt"));
++    const title = norm(el.getAttribute("title"));
++    const text = textOf(el);
++    if (text && text.length <= 200) return text;
++    if (title) return title;
++    if (text) return text.slice(0, 200);
++    const img = el.querySelector("img[alt]");
++    if (img) return norm(img.getAttribute("alt"));
++    return norm(el.getAttribute("name")) || norm(el.getAttribute("value"));
++  }
++
++  function cssEscape(s) {
++    return typeof CSS !== "undefined" && CSS.escape ? CSS.escape(s) : s.replace(/([^\w-])/g, "\\$1");
++  }
++
++  function unique(sel, el) {
++    try {
++      const found = document.querySelectorAll(sel);
++      return found.length === 1 && found[0] === el;
++    } catch {
++      return false;
++    }
++  }
++
++  function selectorFor(el) {
++    if (el.id && unique("#" + cssEscape(el.id), el)) return "#" + cssEscape(el.id);
++    const tag = el.tagName.toLowerCase();
++    for (const attr of ["name", "data-testid", "data-test", "data-id", "aria-label", "placeholder"]) {
++      const v = el.getAttribute(attr);
++      if (v) {
++        const sel = `${tag}[${attr}=${JSON.stringify(v)}]`;
++        if (unique(sel, el)) return sel;
++      }
++    }
++    const parts = [];
++    let cur = el;
++    while (cur && cur.nodeType === 1 && cur !== document.documentElement) {
++      let part = cur.tagName.toLowerCase();
++      if (cur.id && unique("#" + cssEscape(cur.id), cur)) {
++        parts.unshift("#" + cssEscape(cur.id));
++        break;
++      }
++      const parent = cur.parentElement;
++      if (parent) {
++        const sameTag = [...parent.children].filter((c) => c.tagName === cur.tagName);
++        if (sameTag.length > 1) part += `:nth-of-type(${sameTag.indexOf(cur) + 1})`;
++      }
++      parts.unshift(part);
++      cur = parent;
++    }
++    return parts.join(" > ");
++  }
++
++  function refFor(el) {
++    for (const [k, v] of Object.entries(refs.refs)) {
++      if (v === el) return k;
++    }
++    const id = "e" + refs.nextRef++;
++    refs.refs[id] = el;
++    return id;
++  }
++
++  function describe(el, opts) {
++    opts = opts || {};
++    const role = roleOf(el);
++    const tag = el.tagName.toLowerCase();
++    const r = el.getBoundingClientRect();
++    const d = {
++      ref: refFor(el),
++      role,
++      name: nameOf(el),
++      tag,
++      selector: selectorFor(el),
++    };
++    if (tag === "input") d.type = (el.type || "text").toLowerCase();
++    if (tag === "input" || tag === "textarea" || tag === "select") {
++      if (d.type !== "password") d.value = el.value;
++    } else if (el.isContentEditable) {
++      d.value = textOf(el).slice(0, 200);
++    }
++    if (role === "checkbox" || role === "radio" || role === "switch" || role === "menuitemcheckbox") {
++      const ac = el.getAttribute("aria-checked");
++      d.checked = ac != null ? ac === "true" : !!el.checked;
++    }
++    if (el.disabled || el.getAttribute("aria-disabled") === "true") d.disabled = true;
++    const exp = el.getAttribute("aria-expanded");
++    if (exp != null) d.expanded = exp === "true";
++    if (el.getAttribute("aria-invalid") === "true") d.invalid = true;
++    if (el.required || el.getAttribute("aria-required") === "true") d.required = true;
++    if (tag === "a" && el.href) d.href = el.href;
++    if (tag === "select") {
++      d.options = [...el.options].slice(0, 50).map((o) => o.text);
++    }
++    if (opts.rect) {
++      d.rect = { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
++    }
++    d.inViewport = r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
++    return d;
++  }
++
++  function candidates(root) {
++    root = root || document;
++    const out = [];
++    const seen = new Set();
++    for (const el of root.querySelectorAll(INTERACTIVE)) {
++      if (seen.has(el)) continue;
++      seen.add(el);
++      out.push(el);
++    }
++    return out;
++  }
++
++  function listInteractables(opts) {
++    opts = opts || {};
++    const limit = opts.limit || 200;
++    const out = [];
++    for (const el of candidates()) {
++      const role = roleOf(el);
++      if (role === "hidden" || SKIP_ROLES.has(role)) continue;
++      if (role === "generic" && !el.hasAttribute("tabindex") && !el.hasAttribute("onclick") && !el.isContentEditable) continue;
++      if (!opts.includeHidden && !isVisible(el)) continue;
++      out.push(describe(el, opts));
++      if (out.length >= limit) break;
++    }
++    return out;
++  }
++
++  function matchText(actual, wanted, exact) {
++    const a = norm(actual);
++    const w = norm(wanted);
++    if (!w) return true;
++    if (exact) return a === w;
++    return a.toLowerCase().includes(w.toLowerCase());
++  }
++
++  function resolveAll(locator) {
++    if (typeof locator === "string") {
++      if (locator.startsWith("@")) {
++        const el = refs.refs[locator.slice(1)];
++        if (!el) throw new Error(`stale or unknown ref ${locator}; call snapshot() again`);
++        if (!el.isConnected) throw new Error(`ref ${locator} is no longer in the document; call snapshot() again`);
++        return [el];
++      }
++      return [...document.querySelectorAll(locator)];
++    }
++    if (!locator || typeof locator !== "object") throw new Error("locator must be a selector string or object");
++    if (locator.ref) return resolveAll("@" + String(locator.ref).replace(/^@/, ""));
++    let els = locator.selector ? [...document.querySelectorAll(locator.selector)] : candidates();
++    if (locator.role) {
++      const roles = Array.isArray(locator.role) ? locator.role : [locator.role];
++      els = els.filter((el) => roles.includes(roleOf(el)));
++    }
++    if (locator.text != null) {
++      els = els.filter((el) => matchText(textOf(el), locator.text, locator.exact));
++      // Prefer the innermost matching elements so `text: "Next"` resolves to the button, not its container.
++      els = els.filter((el) => !els.some((other) => other !== el && el.contains(other)));
++    }
++    if (locator.label != null || locator.name != null) {
++      const wanted = locator.label != null ? locator.label : locator.name;
++      els = els.filter((el) => matchText(nameOf(el), wanted, locator.exact));
++    }
++    if (locator.placeholder != null) {
++      els = els.filter((el) => matchText(el.getAttribute("placeholder"), locator.placeholder, locator.exact));
++    }
++    if (locator.visible !== false) {
++      els = els.filter(isVisible);
++    }
++
++    return els;
++  }
++
++  function resolve(locator) {
++    const els = resolveAll(locator);
++    const index = typeof locator === "object" && locator && locator.index ? locator.index : 0;
++    if (!els.length) throw new Error(`element not found: ${JSON.stringify(locator)}`);
++    if (index >= els.length) {
++      throw new Error(`locator ${JSON.stringify(locator)} matched ${els.length} element(s); index ${index} out of range`);
++    }
++    return els[index];
++  }
++
++  function clickPoint(el) {
++    el.scrollIntoView({ block: "center", inline: "center" });
++    const r = el.getBoundingClientRect();
++    const x = r.left + r.width / 2;
++    const y = r.top + r.height / 2;
++    const hit = document.elementFromPoint(x, y);
++    const hitOk = !!hit && (hit === el || el.contains(hit) || hit.contains(el));
++    return { x, y, hit: hitOk, width: r.width, height: r.height };
++  }
++
++  function alerts() {
++    const out = [];
++    const seen = new Set();
++    // Assertive regions are reported as alerts; polite regions as status. Live regions that wrap
++    // controls (a labelled combobox, a language picker) are announcements of the control itself, not messages.
++    for (const el of document.querySelectorAll('[role="alert"], [aria-live="assertive"], [aria-live="polite"], [role="status"]')) {
++      const t = textOf(el);
++      if (!t || seen.has(t) || !isVisible(el)) continue;
++      if (el.matches(CONTROLS) || el.querySelector(CONTROLS)) continue;
++      seen.add(t);
++      const assertive = el.getAttribute("role") === "alert" || el.getAttribute("aria-live") === "assertive";
++      out.push({ kind: assertive ? "alert" : "status", text: t.slice(0, 300) });
++    }
++    let invalid = [...document.querySelectorAll('[aria-invalid="true"]')];
++    try {
++      invalid = invalid.concat([...document.querySelectorAll(":user-invalid")]);
++    } catch {
++      // :user-invalid unsupported
++    }
++    for (const el of invalid) {
++      if (!(el instanceof HTMLElement) || el.tagName === "FORM" || el.tagName === "FIELDSET") continue;
++      if (!isVisible(el)) continue;
++      let msg = "";
++      const desc = el.getAttribute("aria-describedby") || el.getAttribute("aria-errormessage");
++      if (desc) {
++        msg = norm(
++          desc
++            .split(/\s+/)
++            .map((id) => {
++              const n = document.getElementById(id);
++              return n ? n.innerText || n.textContent : "";
++            })
++            .join(" ")
++        );
++      }
++      if (!msg && el.validationMessage) msg = el.validationMessage;
++      const key = "invalid:" + selectorFor(el);
++      if (seen.has(key)) continue;
++      seen.add(key);
++      out.push({ kind: "invalid", field: nameOf(el), selector: selectorFor(el), text: msg.slice(0, 300) });
++    }
++    return out;
++  }
++
++  function installMutationTracker() {
++    if (window.__cdpkitMutation) return;
++    const state = { last: Date.now(), count: 0 };
++    const obs = new MutationObserver(() => {
++      state.last = Date.now();
++      state.count++;
++    });
++    obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true, characterData: true });
++    window.__cdpkitMutation = state;
++  }
++
++  // Milliseconds since the last DOM mutation or completed network resource.
++  function quietFor() {
++    installMutationTracker();
++    let last = window.__cdpkitMutation.last;
++    try {
++      for (const e of performance.getEntriesByType("resource")) {
++        const end = performance.timeOrigin + e.responseEnd;
++        if (end > last) last = end;
++      }
++    } catch {
++      // performance API unavailable
++    }
++    return Date.now() - last;
++  }
++
++  return {
++    isVisible,
++    roleOf,
++    nameOf,
++    textOf,
++    selectorFor,
++    describe,
++    listInteractables,
++    resolveAll,
++    resolve,
++    clickPoint,
++    alerts,
++    quietFor,
++  };
++}
++
++const PAGE_HELPERS = `(${pageHelpers.toString()})()`;
++
++/**
++ * Build a Runtime.evaluate expression that runs `body` with `h` bound to the
++ * page helpers and `args` bound to the JSON-serialised arguments.
++ * `body` should be a JS expression or a block that `return`s.
++ */
++function withHelpers(body, args) {
++  return `(function(){ const h = ${PAGE_HELPERS}; const args = ${JSON.stringify(args === undefined ? null : args)}; ${body} })()`;
++}
++
++module.exports = { pageHelpers, PAGE_HELPERS, withHelpers };
+diff --git a/drivers/chrome.js b/drivers/chrome.js
+index 6a32221..e8371ef 100644
+--- a/drivers/chrome.js
++++ b/drivers/chrome.js
+@@ -1,10 +1,9 @@
+ const session = require("../session");
+ const transport = require("../transport");
+ const primitives = require("../primitives");
+-const observation = require("../observation");
+ 
+-async function start({ port = 9229, kill = false, url } = {}) {
+-  const s = await session.start("chrome", { port, kill });
++async function start({ port = 9229, kill = false, url, target } = {}) {
++  const s = await session.start("chrome", { port, kill, target });
+   if (url) {
+     await navigate(s.client, url);
+   }
+@@ -15,12 +14,30 @@ async function stop(s) {
+   await session.stop(s);
+ }
+ 
+-async function navigate(client, url) {
+-  await transport.call(client, "Page", "navigate", { url });
+-  await primitives.waitFor(client, "document.readyState === 'complete'", {
+-    timeout: 30000,
+-    interval: 100,
+-  });
++async function navigate(client, url, { timeout = 30000, settle = true } = {}) {
++  const res = await transport.call(client, "Page", "navigate", { url });
++  if (res && res.errorText) {
++    throw new Error(`navigation to ${url} failed: ${res.errorText}`);
++  }
++  await primitives.waitFor(client, "document.readyState === 'complete'", { timeout, interval: 100 });
++  if (settle) await primitives.waitForStable(client, { timeout: 5000, throwOnTimeout: false });
++  return primitives.eval(client, "location.href");
++}
++
++async function back(client) {
++  await primitives.eval(client, "history.back()");
++  await primitives.waitForStable(client, { timeout: 5000, throwOnTimeout: false });
++  return primitives.eval(client, "location.href");
++}
++
++async function forward(client) {
++  await primitives.eval(client, "history.forward()");
++  await primitives.waitForStable(client, { timeout: 5000, throwOnTimeout: false });
++  return primitives.eval(client, "location.href");
++}
++
++async function getUrl(client) {
++  return primitives.eval(client, "location.href");
+ }
+ 
+ async function getTitle(client) {
+@@ -32,19 +49,109 @@ async function getText(client) {
+ }
+ 
+ async function screenshot(client, opts) {
+-  return observation.captureScreenshot(client, opts);
++  return primitives.captureScreenshot(client, opts);
++}
++
++async function run(client, expression, opts) {
++  return primitives.eval(client, expression, opts);
++}
++
++/**
++ * Everything an agent needs to decide the next action on the current tab:
++ * url, title, visible text, interactable elements (with refs usable as
++ * locators, e.g. click(client, "@e3")), validation alerts, and a screenshot.
++ */
++async function getContext(client, { screenshot: withShot = true, screenshotPath, textLimit = 20000, limit = 200 } = {}) {
++  const [url, title, visibleText, interactables, alerts, shot] = await Promise.all([
++    getUrl(client),
++    getTitle(client),
++    primitives.getText(client),
++    primitives.snapshot(client, { limit }),
++    primitives.getAlerts(client),
++    withShot ? primitives.captureScreenshot(client, { path: screenshotPath }) : Promise.resolve(null),
++  ]);
++  const ctx = {
++    url,
++    title,
++    visibleText: visibleText.length > textLimit ? `${visibleText.slice(0, textLimit)}…` : visibleText,
++    interactables,
++    alerts,
++  };
++  if (withShot) {
++    if (screenshotPath) ctx.screenshotPath = shot;
++    else ctx.screenshot = shot;
++  }
++  return ctx;
++}
++
++const snapshot = primitives.snapshot;
++const find = primitives.find;
++const findAll = primitives.findAll;
++const click = primitives.click;
++const type = primitives.type;
++const press = primitives.press;
++const select = primitives.select;
++const getAlerts = primitives.getAlerts;
++const waitForText = primitives.waitForText;
++const waitForUrl = primitives.waitForUrl;
++const waitForElement = primitives.waitForElement;
++const waitForStable = primitives.waitForStable;
++
++// Tabs. These take the session (not the client) because switching re-points
++// `s.client` at another target.
++async function tabs(s) {
++  const current = s.target && s.target.id;
++  return (await session.listTargets(s)).map((t) => ({
++    id: t.id,
++    url: t.url,
++    title: t.title,
++    active: t.id === current,
++  }));
++}
++
++async function switchTab(s, predicate) {
++  return session.switchTarget(s, predicate);
++}
++
++async function newTab(s, url = "about:blank") {
++  await session.openTarget(s, url);
++  if (url !== "about:blank") {
++    await primitives.waitFor(s.client, "document.readyState === 'complete'", { timeout: 30000 });
++    await primitives.waitForStable(s.client, { timeout: 5000, throwOnTimeout: false });
++  }
++  return s;
+ }
+ 
+-async function run(client, expression) {
+-  return primitives.eval(client, expression);
++async function closeTab(s, targetId) {
++  return session.closeTarget(s, targetId);
+ }
+ 
+ module.exports = {
+   start,
+   stop,
+   navigate,
++  back,
++  forward,
++  getUrl,
+   getTitle,
+   getText,
++  getContext,
+   screenshot,
+   run,
++  snapshot,
++  find,
++  findAll,
++  click,
++  type,
++  press,
++  select,
++  getAlerts,
++  waitForText,
++  waitForUrl,
++  waitForElement,
++  waitForStable,
++  tabs,
++  switchTab,
++  newTab,
++  closeTab,
+ };
+diff --git a/observation.js b/observation.js
+index 25a0355..ad7c3b4 100644
+--- a/observation.js
++++ b/observation.js
+@@ -1,4 +1,4 @@
+-const transport = require("./transport");
++const primitives = require("./primitives");
+ 
+ function onEvent(client, event, handler) {
+   if (!client || typeof client.on !== "function") {
+@@ -12,14 +12,8 @@ function offEvent(client, event, handler) {
+   client.off(event, handler);
+ }
+ 
+-async function captureScreenshot(client, { format = "png", fullSize = false } = {}) {
+-  const params = { format };
+-  if (fullSize) {
+-    params.clip = undefined; // Page.captureScreenshot handles fullSize via fromSurface
+-    params.fromSurface = true;
+-  }
+-  const res = await transport.call(client, "Page", "captureScreenshot", params);
+-  return res && res.data;
++async function captureScreenshot(client, { format = "png", fullSize = false, fullPage = fullSize, path } = {}) {
++  return primitives.captureScreenshot(client, { format, fullPage, path });
+ }
+ 
+ function observeNetwork(client) {
+diff --git a/package.json b/package.json
+index 4958306..a50d9a1 100644
+--- a/package.json
++++ b/package.json
+@@ -4,7 +4,7 @@
+   "description": "CDP automation core for agentic control of Chrome, Slack, and Notion.",
+   "main": "index.js",
+   "scripts": {
+-    "test": "echo \"Error: no test specified\" && exit 1",
++    "test": "node --test test/",
+     "probe": "node bin/probe.js"
+   },
+   "keywords": [],
+diff --git a/primitives.js b/primitives.js
+index eb9caa6..0075b04 100644
+--- a/primitives.js
++++ b/primitives.js
+@@ -1,4 +1,6 @@
++const fs = require("fs");
+ const transport = require("./transport");
++const { withHelpers } = require("./dom");
+ 
+ function sleep(ms) {
+   return new Promise((r) => setTimeout(r, ms));
+@@ -24,6 +26,11 @@ async function eval(client, expression, { returnByValue = true, awaitPromise = f
+   return unwrapResult(res);
+ }
+ 
++// Run `body` in the page with `h` (dom.js helpers) and `args` in scope.
++async function evalWithHelpers(client, body, args) {
++  return eval(client, withHelpers(body, args), { returnByValue: true });
++}
++
+ async function getText(client) {
+   return eval(client, "document.body ? document.body.innerText : ''", { returnByValue: true });
+ }
+@@ -41,25 +48,244 @@ async function query(client, selector) {
+   return res;
+ }
+ 
+-async function click(client, selector) {
+-  return eval(client, `(function(){
+-    const el = document.querySelector(${JSON.stringify(selector)});
+-    if (!el) throw new Error('element not found: ' + ${JSON.stringify(selector)});
+-    el.click();
+-    return true;
+-  })()`, { returnByValue: true });
++/**
++ * Locators accepted by click/type/select/find/waitForElement:
++ *   - CSS selector string:            "input[name=firstName]"
++ *   - ref from snapshot():            "@e12"  or { ref: "e12" }
++ *   - descriptor object:              { text: "Next", role: "button" }
++ *       text        visible text (substring, case-insensitive; `exact: true` for equality)
++ *       label/name  accessible name: aria-label, <label>, placeholder, title, alt
++ *       role        ARIA role, explicit or implicit ("button", "textbox", "link", "option", ...)
++ *       placeholder placeholder attribute
++ *       selector    restrict candidates to this CSS selector
++ *       index       pick the n-th match (default 0)
++ *       visible     default: prefer visible matches; `true` = visible only; `false` = any
++ */
++async function find(client, locator) {
++  return evalWithHelpers(client, `return h.describe(h.resolve(args), { rect: true });`, locator);
++}
++
++async function findAll(client, locator, { limit = 50 } = {}) {
++  return evalWithHelpers(
++    client,
++    `return h.resolveAll(args.locator).slice(0, args.limit).map((el) => h.describe(el, { rect: true }));`,
++    { locator, limit }
++  );
++}
++
++async function snapshot(client, { limit = 200, includeHidden = false, rect = false } = {}) {
++  return evalWithHelpers(client, `return h.listInteractables(args);`, { limit, includeHidden, rect });
++}
++
++async function getAlerts(client) {
++  return evalWithHelpers(client, `return h.alerts();`);
++}
++
++async function scrollIntoView(client, locator) {
++  return evalWithHelpers(
++    client,
++    `h.resolve(args).scrollIntoView({ block: "center", inline: "center" }); return true;`,
++    locator
++  );
++}
++
++async function mouseClick(client, x, y, { button = "left", clickCount = 1 } = {}) {
++  await transport.call(client, "Input", "dispatchMouseEvent", { type: "mouseMoved", x, y });
++  await transport.call(client, "Input", "dispatchMouseEvent", { type: "mousePressed", x, y, button, clickCount });
++  await transport.call(client, "Input", "dispatchMouseEvent", { type: "mouseReleased", x, y, button, clickCount });
++}
++
++/**
++ * Click an element. Dispatches real mouse events at the element's centre when
++ * the element is hit-testable there; otherwise falls back to `el.click()`.
++ * Pass `{ js: true }` to force the DOM click, `{ settle: false }` to return
++ * immediately without waiting for the DOM to quiesce.
++ */
++async function click(client, locator, { js = false, settle = true, settleTimeout = 5000 } = {}) {
++  const point = await evalWithHelpers(
++    client,
++    `const el = h.resolve(args); const p = h.clickPoint(el); p.disabled = !!(el.disabled || el.getAttribute("aria-disabled") === "true"); return p;`,
++    locator
++  );
++  if (point.disabled) {
++    throw new Error(`element is disabled: ${JSON.stringify(locator)}`);
++  }
++  let method = "mouse";
++  if (!js && point.hit && point.width > 0 && point.height > 0) {
++    await mouseClick(client, point.x, point.y);
++  } else {
++    method = "js";
++    await evalWithHelpers(client, `h.resolve(args).click(); return true;`, locator);
++  }
++  if (settle) await waitForStable(client, { timeout: settleTimeout, throwOnTimeout: false });
++  return { method, x: point.x, y: point.y };
+ }
+ 
+-async function type(client, selector, text) {
+-  return eval(client, `(function(){
+-    const el = document.querySelector(${JSON.stringify(selector)});
+-    if (!el) throw new Error('element not found: ' + ${JSON.stringify(selector)});
++/**
++ * Type into an input, textarea or contenteditable. Focuses the element and
++ * inserts text through `Input.insertText` so framework listeners (React,
++ * Angular, Polymer, ...) observe a real user edit. Falls back to setting
++ * `.value` + synthetic events if the text did not land.
++ */
++async function type(client, locator, text, { clear = true, submit = false, settle = true } = {}) {
++  text = String(text);
++  const info = await evalWithHelpers(
++    client,
++    `
++    const el = h.resolve(args.locator);
++    if (el.disabled || el.readOnly) throw new Error("element is disabled or read-only: " + JSON.stringify(args.locator));
++    el.scrollIntoView({ block: "center", inline: "center" });
+     el.focus();
+-    el.value = ${JSON.stringify(text)};
+-    el.dispatchEvent(new Event('input', { bubbles: true }));
+-    el.dispatchEvent(new Event('change', { bubbles: true }));
+-    return true;
+-  })()`, { returnByValue: true });
++    const editable = el.isContentEditable;
++    if (args.clear) {
++      if (editable) {
++        const sel = window.getSelection();
++        const range = document.createRange();
++        range.selectNodeContents(el);
++        sel.removeAllRanges();
++        sel.addRange(range);
++      } else if (typeof el.select === "function") {
++        el.select();
++      }
++    } else if (!editable && typeof el.setSelectionRange === "function") {
++      try { el.setSelectionRange(el.value.length, el.value.length); } catch {}
++    }
++    return { editable, focused: document.activeElement === el, value: editable ? h.textOf(el) : el.value };
++    `,
++    { locator, clear }
++  );
++  if (!info.focused) {
++    // Some widgets only accept focus from a real pointer interaction.
++    await click(client, locator, { settle: false });
++  }
++  await transport.call(client, "Input", "insertText", { text });
++  const result = await evalWithHelpers(
++    client,
++    `
++    const el = h.resolve(args.locator);
++    const actual = el.isContentEditable ? h.textOf(el) : el.value;
++    const ok = actual === args.expected;
++    if (ok) return { ok: true, method: "insertText" };
++    if (el.isContentEditable) return { ok: false, method: "insertText", actual };
++    el.value = args.expected;
++    el.dispatchEvent(new Event("input", { bubbles: true }));
++    el.dispatchEvent(new Event("change", { bubbles: true }));
++    return { ok: el.value === args.expected, method: "value", actual: el.value };
++    `,
++    { locator, text, clear, expected: clear ? text : info.value + text }
++  );
++  if (!result.ok) {
++    throw new Error(`type() failed for ${JSON.stringify(locator)}: field contains ${JSON.stringify(result.actual)}`);
++  }
++  if (submit) await press(client, "Enter", { settle });
++  else if (settle) await waitForStable(client, { timeout: 2000, throwOnTimeout: false });
++  return result;
++}
++
++const KEYS = {
++  Enter: { key: "Enter", code: "Enter", keyCode: 13, text: "\r" },
++  Tab: { key: "Tab", code: "Tab", keyCode: 9 },
++  Escape: { key: "Escape", code: "Escape", keyCode: 27 },
++  Backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
++  Delete: { key: "Delete", code: "Delete", keyCode: 46 },
++  Space: { key: " ", code: "Space", keyCode: 32, text: " " },
++  ArrowUp: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
++  ArrowDown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
++  ArrowLeft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
++  ArrowRight: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
++  Home: { key: "Home", code: "Home", keyCode: 36 },
++  End: { key: "End", code: "End", keyCode: 35 },
++  PageUp: { key: "PageUp", code: "PageUp", keyCode: 33 },
++  PageDown: { key: "PageDown", code: "PageDown", keyCode: 34 },
++};
++const MODIFIERS = { Alt: 1, Control: 2, Ctrl: 2, Meta: 4, Cmd: 4, Command: 4, Shift: 8 };
++
++function keyDescriptor(combo) {
++  const parts = String(combo).split("+");
++  const name = parts.pop();
++  let modifiers = 0;
++  for (const m of parts) {
++    if (!(m in MODIFIERS)) throw new Error(`Unknown modifier: ${m}`);
++    modifiers |= MODIFIERS[m];
++  }
++  let desc = KEYS[name];
++  if (!desc) {
++    if (name.length !== 1) throw new Error(`Unknown key: ${name}`);
++    const upper = name.toUpperCase();
++    desc = {
++      key: name,
++      code: /[A-Z]/.test(upper) ? `Key${upper}` : /[0-9]/.test(name) ? `Digit${name}` : "",
++      keyCode: upper.charCodeAt(0),
++      text: modifiers & ~8 ? undefined : name,
++    };
++  }
++  return { ...desc, modifiers };
++}
++
++/**
++ * Press a key or chord, e.g. "Enter", "Tab", "Escape", "ArrowDown", "a", "Control+a".
++ */
++async function press(client, combo, { settle = true, settleTimeout = 5000 } = {}) {
++  const k = keyDescriptor(combo);
++  const base = {
++    key: k.key,
++    code: k.code,
++    windowsVirtualKeyCode: k.keyCode,
++    nativeVirtualKeyCode: k.keyCode,
++    modifiers: k.modifiers,
++  };
++  await transport.call(client, "Input", "dispatchKeyEvent", {
++    ...base,
++    type: k.text ? "keyDown" : "rawKeyDown",
++    text: k.text,
++    unmodifiedText: k.text,
++  });
++  await transport.call(client, "Input", "dispatchKeyEvent", { ...base, type: "keyUp" });
++  if (settle) await waitForStable(client, { timeout: settleTimeout, throwOnTimeout: false });
++  return true;
++}
++
++/**
++ * Choose an option in a native <select> or an ARIA combobox/listbox widget.
++ * `option` matches option text (exact first, then substring) or a <select> value.
++ */
++async function select(client, locator, option, { settle = true } = {}) {
++  const native = await evalWithHelpers(
++    client,
++    `
++    const el = h.resolve(args.locator);
++    if (el.tagName !== "SELECT") return { native: false };
++    const opts = [...el.options];
++    const want = String(args.option);
++    const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
++    let idx = opts.findIndex((o) => o.value === want || norm(o.text) === norm(want));
++    if (idx < 0) idx = opts.findIndex((o) => norm(o.text).includes(norm(want)));
++    if (idx < 0) throw new Error("option not found: " + want + "; available: " + opts.map((o) => o.text).join(" | "));
++    el.selectedIndex = idx;
++    el.dispatchEvent(new Event("input", { bubbles: true }));
++    el.dispatchEvent(new Event("change", { bubbles: true }));
++    return { native: true, value: opts[idx].value, text: opts[idx].text };
++    `,
++    { locator, option }
++  );
++  if (native.native) { if (settle) await waitForStable(client, { timeout: 2000, throwOnTimeout: false }); return native; }
++
++  await click(client, locator, { settle: false });
++  const optionLocator = { role: ["option", "menuitem", "menuitemradio", "treeitem"], text: option, exact: true, visible: true };
++  const loose = { ...optionLocator, exact: false };
++  try {
++    await waitForElement(client, optionLocator, { timeout: 3000 });
++  } catch {
++    await waitForElement(client, loose, { timeout: 3000 });
++  }
++  let chosen;
++  try {
++    chosen = await find(client, optionLocator);
++  } catch {
++    chosen = await find(client, loose);
++  }
++  await click(client, { ref: chosen.ref }, { settle });
++  return { native: false, text: chosen.name };
+ }
+ 
+ async function waitFor(client, expression, { timeout = 30000, interval = 100 } = {}) {
+@@ -78,9 +304,70 @@ async function waitForSelector(client, selector, opts) {
+   return waitFor(client, `document.querySelector(${JSON.stringify(selector)})`, opts);
+ }
+ 
+-async function captureScreenshot(client, { fullPage = false } = {}) {
+-  await require("./transport").enable(client, "Page");
+-  const metrics = await require("./transport").call(client, "Page", "getLayoutMetrics");
++async function waitForElement(client, locator, { timeout = 30000, interval = 100 } = {}) {
++  const start = Date.now();
++  while (Date.now() - start < timeout) {
++    const found = await evalWithHelpers(
++      client,
++      `try { return h.resolveAll(args).length > 0; } catch (e) { return false; }`,
++      locator
++    );
++    if (found) return true;
++    await sleep(interval);
++  }
++  throw new Error(`waitForElement timed out after ${timeout}ms: ${JSON.stringify(locator)}`);
++}
++
++async function waitForText(client, text, { timeout = 30000, interval = 100 } = {}) {
++  const start = Date.now();
++  while (Date.now() - start < timeout) {
++    const found = await eval(
++      client,
++      `(document.body ? document.body.innerText : "").toLowerCase().includes(${JSON.stringify(String(text).toLowerCase())})`
++    );
++    if (found) return true;
++    await sleep(interval);
++  }
++  throw new Error(`waitForText timed out after ${timeout}ms: ${JSON.stringify(text)}`);
++}
++
++async function waitForUrl(client, match, { timeout = 30000, interval = 100 } = {}) {
++  const start = Date.now();
++  const test = (url) => (match instanceof RegExp ? match.test(url) : url.includes(String(match)));
++  while (Date.now() - start < timeout) {
++    const url = await eval(client, "location.href");
++    if (test(url)) return url;
++    await sleep(interval);
++  }
++  throw new Error(`waitForUrl timed out after ${timeout}ms: ${match}`);
++}
++
++/**
++ * Wait until the document is loaded and the DOM has stopped mutating for
++ * `quietMs`. Survives navigations (the tracker is re-installed per document).
++ */
++async function waitForStable(client, { quietMs = 400, timeout = 10000, interval = 100, throwOnTimeout = true } = {}) {
++  const start = Date.now();
++  let lastErr;
++  while (Date.now() - start < timeout) {
++    try {
++      const st = await evalWithHelpers(client, `return { ready: document.readyState, quiet: h.quietFor() };`);
++      if (st.ready === "complete" && st.quiet >= quietMs) return true;
++    } catch (err) {
++      // Execution context destroyed mid-navigation; retry.
++      lastErr = err;
++    }
++    await sleep(interval);
++  }
++  if (throwOnTimeout) {
++    throw new Error(`waitForStable timed out after ${timeout}ms${lastErr ? `: ${lastErr.message}` : ""}`);
++  }
++  return false;
++}
++
++async function captureScreenshot(client, { fullPage = false, format = "png", path } = {}) {
++  await transport.enable(client, "Page");
++  const metrics = await transport.call(client, "Page", "getLayoutMetrics");
+   const viewport = metrics.cssLayoutViewport || metrics.layoutViewport;
+   const content = metrics.cssContentSize || metrics.contentSize;
+   const clip = fullPage
+@@ -98,18 +385,38 @@ async function captureScreenshot(client, { fullPage = false } = {}) {
+         height: viewport.clientHeight,
+         scale: 1,
+       };
+-  const res = await require("./transport").call(client, "Page", "captureScreenshot", { format: "png", fromSurface: true, clip });
++  const params = { format, fromSurface: true, clip };
++  if (fullPage) params.captureBeyondViewport = true;
++  const res = await transport.call(client, "Page", "captureScreenshot", params);
++  if (path) {
++    fs.writeFileSync(path, Buffer.from(res.data, "base64"));
++    return path;
++  }
+   return res.data;
+ }
+ 
+ module.exports = {
+   eval,
++  evalWithHelpers,
+   getText,
+   getHtml,
+   query,
++  find,
++  findAll,
++  snapshot,
++  getAlerts,
++  scrollIntoView,
+   click,
++  mouseClick,
+   type,
++  press,
++  keyDescriptor,
++  select,
+   waitFor,
+   waitForSelector,
++  waitForElement,
++  waitForText,
++  waitForUrl,
++  waitForStable,
+   captureScreenshot,
+ };
+diff --git a/session.js b/session.js
+index dda2353..56a303c 100644
+--- a/session.js
++++ b/session.js
+@@ -25,9 +25,14 @@ async function waitForCdp(host, port, attempts = 40, interval = 1000) {
+ }
+ 
+ function isAppRunning(app) {
+-  if (!app.processName) return Promise.resolve(false);
++  const args = app.processPattern
++    ? ["-f", "--", app.processPattern]
++    : app.processName
++      ? ["-x", "--", app.processName]
++      : null;
++  if (!args) return Promise.resolve(false);
+   return new Promise((resolve) => {
+-    execFile("pgrep", ["-x", app.processName], (err) => {
++    execFile("pgrep", args, (err) => {
+       resolve(!err);
+     });
+   });
+@@ -53,6 +58,11 @@ function killApp(app, wait = false) {
+ 
+ function launchApp(app, port) {
+   const args = app.launchArgs(port);
++  if (!args) {
++    throw new Error(
++      `Launching ${app.name} is not supported on ${process.platform}; start it with --remote-debugging-port=${port} and attach`
++    );
++  }
+   const child = spawn(args[0], args.slice(1), {
+     detached: true,
+     stdio: "ignore",
+@@ -82,8 +92,11 @@ async function start(appName, { host = "127.0.0.1", port, kill = false, target }
+     return { client, target: chosen, host, port: targetPort, ownsProcess: false, appName };
+   }
+ 
+-  if (process.platform !== "darwin") {
+-    throw new Error(`Launching ${app.name} is only supported on macOS`);
++  if (!app.launchArgs(targetPort)) {
++    throw new Error(
++      `CDP is not reachable on ${host}:${targetPort} and launching ${app.name} is not supported on ${process.platform}; ` +
++        `start it with --remote-debugging-port=${targetPort} (or pass the port it already listens on) and attach`
++    );
+   }
+ 
+   if (alreadyCdp || (await isAppRunning(app)) || kill) {
+@@ -117,6 +130,60 @@ async function start(appName, { host = "127.0.0.1", port, kill = false, target }
+   return { client, target: chosen, host, port: targetPort, ownsProcess: true, appName };
+ }
+ 
++function pageTargets(targets) {
++  return targets.filter((t) => t.type === "page");
++}
++
++async function listTargets(session, { all = false } = {}) {
++  const targets = await transport.listTargets(session.host, session.port);
++  return all ? targets : pageTargets(targets);
++}
++
++/**
++ * Point `session.client` at a different target (tab). `predicate` accepts the
++ * same shapes as `transport.findTarget` ({ url }, { title }, { id }, fn) plus
++ * `{ index }` into the page list. Mutates and returns `session`.
++ */
++async function switchTarget(session, predicate) {
++  const targets = await transport.listTargets(session.host, session.port);
++  let chosen;
++  if (predicate && typeof predicate === "object" && "index" in predicate) {
++    chosen = pageTargets(targets)[predicate.index];
++  } else {
++    chosen = transport.findTarget(pageTargets(targets), predicate);
++  }
++  if (!chosen) {
++    throw new Error(`No CDP page target matched ${JSON.stringify(predicate)} on ${session.host}:${session.port}`);
++  }
++  if (session.target && chosen.id === session.target.id) return session;
++  const old = session.client;
++  const { client } = await transport.connect({ host: session.host, port: session.port, target: { id: chosen.id } });
++  session.client = client;
++  session.target = chosen;
++  state.setLastWorking(session.host, session.port, { targetId: chosen.id });
++  await transport.close(old);
++  return session;
++}
++
++async function openTarget(session, url = "about:blank", { background = false } = {}) {
++  const { targetId } = await transport.call(session.client, "Target", "createTarget", { url, background });
++  return switchTarget(session, { id: targetId });
++}
++
++async function closeTarget(session, targetId) {
++  const id = targetId || (session.target && session.target.id);
++  const closingCurrent = session.target && id === session.target.id;
++  await transport.call(session.client, "Target", "closeTarget", { targetId: id });
++  if (closingCurrent) {
++    await transport.close(session.client);
++    session.client = null;
++    session.target = null;
++    const remaining = await listTargets(session);
++    if (remaining.length) await switchTarget(session, { id: remaining[0].id });
++  }
++  return session;
++}
++
+ async function stop(session) {
+   if (session && session.client) {
+     await transport.close(session.client);
+@@ -132,4 +199,8 @@ module.exports = {
+   start,
+   stop,
+   reachable,
++  listTargets,
++  switchTarget,
++  openTarget,
++  closeTarget,
+ };
+diff --git a/test/chrome.test.js b/test/chrome.test.js
+new file mode 100644
+index 0000000..35f19fe
+--- /dev/null
++++ b/test/chrome.test.js
+@@ -0,0 +1,140 @@
++// Integration tests for the Chrome driver. They attach to a Chrome instance
++// that already exposes CDP on CDPKIT_TEST_PORT (default 9229) and skip when
++// none is reachable. Run with: npm test
++const test = require("node:test");
++const assert = require("node:assert/strict");
++const path = require("path");
++const fs = require("fs");
++const os = require("os");
++
++const chrome = require("../drivers/chrome");
++const session = require("../session");
++
++const port = parseInt(process.env.CDPKIT_TEST_PORT || "9229", 10);
++const fixture = `file://${path.join(__dirname, "fixtures", "form.html")}`;
++
++test("chrome driver", { concurrency: false }, async (t) => {
++  if (!(await session.reachable("127.0.0.1", port))) {
++    t.skip(`no CDP endpoint on 127.0.0.1:${port}; set CDPKIT_TEST_PORT`);
++    return;
++  }
++
++  const s = await chrome.start({ port });
++  await chrome.newTab(s, fixture);
++  const c = () => s.client;
++
++  t.after(async () => {
++    await chrome.closeTab(s);
++    await chrome.stop(s);
++  });
++
++  await t.test("navigate settles after late DOM mutations", async () => {
++    await chrome.navigate(c(), fixture);
++    assert.equal(await chrome.run(c(), "document.getElementById('mutating').textContent"), "late content");
++  });
++
++  await t.test("snapshot lists visible interactables with roles, names and refs", async () => {
++    const items = await chrome.snapshot(c());
++    const byName = Object.fromEntries(items.map((i) => [i.name, i]));
++    assert.equal(byName["First name"].role, "textbox");
++    assert.equal(byName["First name"].selector, "#first");
++    assert.equal(byName["Last name (optional)"].role, "textbox");
++    assert.equal(byName["I agree"].role, "checkbox");
++    assert.equal(byName["I agree"].checked, false);
++    assert.equal(byName["Colour"].role, "combobox");
++    assert.deepEqual(byName["Colour"].options, ["Pick", "Red", "Green"]);
++    assert.equal(byName["Next"].role, "button");
++    assert.equal(byName["Terms"].role, "link");
++    assert.ok(!byName["Hidden help"], "hidden link excluded");
++    assert.ok(!items.some((i) => i.role === "option"), "options of closed listbox excluded");
++    assert.ok(items.every((i) => /^e\d+$/.test(i.ref)));
++    const all = await chrome.snapshot(c(), { includeHidden: true });
++    assert.ok(all.some((i) => i.name === "Hidden help"));
++  });
++
++  await t.test("type uses trusted input events", async () => {
++    await chrome.type(c(), { label: "First name" }, "Ada");
++    assert.equal(await chrome.run(c(), "document.getElementById('typed').textContent"), "Ada");
++    await chrome.type(c(), "#first", "Grace");
++    assert.equal(await chrome.run(c(), "document.getElementById('first').value"), "Grace");
++    await chrome.type(c(), "#first", " Hopper", { clear: false });
++    assert.equal(await chrome.run(c(), "document.getElementById('first').value"), "Grace Hopper");
++    await chrome.type(c(), { placeholder: "Last name" }, "L");
++    assert.equal(await chrome.run(c(), "document.querySelector('[name=last]').value"), "L");
++  });
++
++  await t.test("click dispatches real pointer events, by text/role/ref", async () => {
++    const r1 = await chrome.click(c(), { text: "Counter", role: "button" });
++    assert.equal(r1.method, "mouse");
++    assert.equal(await chrome.run(c(), "document.getElementById('count').textContent"), "1");
++    const btn = await chrome.find(c(), { text: "Counter" });
++    await chrome.click(c(), `@${btn.ref}`);
++    assert.equal(await chrome.run(c(), "document.getElementById('count').textContent"), "2");
++    await chrome.click(c(), { label: "I agree" });
++    assert.equal(await chrome.run(c(), "document.querySelector('[name=agree]').checked"), true);
++  });
++
++  await t.test("click falls back to el.click() when covered", async () => {
++    await chrome.run(c(), "document.getElementById('overlay').style.display = 'block'");
++    const r = await chrome.click(c(), { label: "I agree" });
++    assert.equal(r.method, "js");
++    assert.equal(await chrome.run(c(), "document.querySelector('[name=agree]').checked"), false);
++    await chrome.run(c(), "document.getElementById('overlay').style.display = 'none'");
++  });
++
++  await t.test("select handles native <select> and ARIA combobox", async () => {
++    const native = await chrome.select(c(), { label: "Colour" }, "Green");
++    assert.deepEqual(native, { native: true, value: "g", text: "Green" });
++    assert.equal(await chrome.run(c(), "document.querySelector('[name=color]').value"), "g");
++    const custom = await chrome.select(c(), { role: "combobox", text: "Month" }, "March");
++    assert.equal(custom.native, false);
++    assert.equal(await chrome.run(c(), "document.getElementById('month').textContent"), "March");
++    assert.equal(await chrome.run(c(), "document.querySelector('[role=listbox]').hidden"), true);
++  });
++
++  await t.test("press sends keys; submit via Enter; alerts surface validation", async () => {
++    await chrome.press(c(), "Escape");
++    assert.equal(await chrome.run(c(), "document.getElementById('out').textContent"), "escaped");
++    await chrome.type(c(), "#first", "", { clear: true });
++    await chrome.click(c(), { text: "Next" });
++    const alerts = await chrome.getAlerts(c());
++    assert.ok(alerts.some((a) => a.kind === "alert" && a.text === "Enter a first name"));
++    assert.ok(alerts.some((a) => a.kind === "invalid" && a.field === "First name"));
++    await chrome.type(c(), "#first", "Ada", { submit: true });
++    await chrome.waitForText(c(), "submitted:Ada", { timeout: 3000 });
++    assert.deepEqual(await chrome.getAlerts(c()), []);
++  });
++
++  await t.test("locator errors are descriptive", async () => {
++    await assert.rejects(chrome.click(c(), { text: "No such button" }), /element not found/);
++    await assert.rejects(chrome.click(c(), "@e99999"), /stale or unknown ref/);
++    await assert.rejects(chrome.select(c(), { label: "Colour" }, "Purple"), /option not found/);
++  });
++
++  await t.test("getContext bundles url, text, interactables, alerts and screenshot", async () => {
++    const shot = path.join(os.tmpdir(), `cdpkit-test-${process.pid}.png`);
++    const ctx = await chrome.getContext(c(), { screenshotPath: shot });
++    assert.equal(ctx.url, fixture);
++    assert.equal(ctx.title, "cdpkit fixture");
++    assert.match(ctx.visibleText, /Fixture/);
++    assert.ok(ctx.interactables.length > 5);
++    assert.deepEqual(ctx.alerts, []);
++    assert.equal(ctx.screenshotPath, shot);
++    assert.ok(fs.statSync(shot).size > 1000);
++    fs.unlinkSync(shot);
++  });
++
++  await t.test("tabs: list, open, switch, close", async () => {
++    const before = await chrome.tabs(s);
++    const active = before.find((x) => x.active);
++    assert.equal(active.url, fixture);
++    await chrome.newTab(s, "about:blank");
++    assert.equal(await chrome.getUrl(s.client), "about:blank");
++    await chrome.switchTab(s, { url: "form.html" });
++    assert.equal(await chrome.getUrl(s.client), fixture);
++    const blank = (await chrome.tabs(s)).find((x) => x.url === "about:blank");
++    await chrome.closeTab(s, blank.id);
++    assert.ok(!(await chrome.tabs(s)).some((x) => x.id === blank.id));
++    assert.equal(await chrome.getUrl(s.client), fixture);
++  });
++});
+diff --git a/test/fixtures/form.html b/test/fixtures/form.html
+new file mode 100644
+index 0000000..829af73
+--- /dev/null
++++ b/test/fixtures/form.html
+@@ -0,0 +1,92 @@
++<!doctype html>
++<html>
++  <head>
++    <meta charset="utf-8" />
++    <title>cdpkit fixture</title>
++    <style>
++      .hidden { display: none; }
++      .listbox { border: 1px solid #999; }
++      .listbox[hidden] { display: none; }
++      #overlay { position: fixed; inset: 0; background: rgba(0,0,0,.3); display: none; }
++    </style>
++  </head>
++  <body>
++    <h1>Fixture</h1>
++    <form id="f" onsubmit="event.preventDefault(); document.getElementById('out').textContent = 'submitted:' + first.value;">
++      <label for="first">First name</label>
++      <input id="first" name="first" />
++      <input name="last" placeholder="Last name (optional)" />
++      <label><input type="checkbox" name="agree" /> I agree</label>
++      <select name="color" aria-label="Colour">
++        <option value="">Pick</option>
++        <option value="r">Red</option>
++        <option value="g">Green</option>
++      </select>
++      <div id="month-wrap">
++        <div id="month" role="combobox" aria-expanded="false" tabindex="0">Month</div>
++        <ul class="listbox" role="listbox" aria-label="Month" hidden>
++          <li role="option">January</li>
++          <li role="option">February</li>
++          <li role="option">March</li>
++        </ul>
++      </div>
++      <button type="submit">Next</button>
++      <button type="button" id="react-btn">Counter: <span id="count">0</span></button>
++      <a href="#help" class="hidden">Hidden help</a>
++      <a href="#terms">Terms</a>
++      <div role="alert" id="err" class="hidden">Enter a first name</div>
++    </form>
++    <p id="out"></p>
++    <p id="typed"></p>
++    <div id="overlay"></div>
++    <div id="mutating"></div>
++    <script>
++      // React-style controlled input: only trusts real input events
++      const first = document.getElementById("first");
++      let firstState = "";
++      first.addEventListener("input", (e) => {
++        if (e.isTrusted) firstState = first.value;
++        document.getElementById("typed").textContent = firstState;
++      });
++      // Button that only reacts to real pointer events
++      const btn = document.getElementById("react-btn");
++      btn.addEventListener("pointerup", (e) => {
++        if (!e.isTrusted) return;
++        const c = document.getElementById("count");
++        c.textContent = String(Number(c.textContent) + 1);
++      });
++      // Custom combobox
++      const month = document.getElementById("month");
++      const list = document.querySelector('[role="listbox"]');
++      month.addEventListener("click", () => {
++        const open = month.getAttribute("aria-expanded") === "true";
++        month.setAttribute("aria-expanded", String(!open));
++        list.hidden = open;
++      });
++      for (const li of list.querySelectorAll("li")) {
++        li.addEventListener("click", () => {
++          month.textContent = li.textContent;
++          month.setAttribute("aria-expanded", "false");
++          list.hidden = true;
++        });
++      }
++      document.getElementById("f").addEventListener("submit", () => {
++        const err = document.getElementById("err");
++        if (!first.value) {
++          err.classList.remove("hidden");
++          first.setAttribute("aria-invalid", "true");
++        } else {
++          err.classList.add("hidden");
++          first.removeAttribute("aria-invalid");
++        }
++      });
++      document.addEventListener("keydown", (e) => {
++        if (e.key === "Escape") document.getElementById("out").textContent = "escaped";
++      });
++      // Simulated async render after load: settle should wait for this
++      setTimeout(() => {
++        document.getElementById("mutating").textContent = "late content";
++      }, 300);
++    </script>
++  </body>
++</html>
+-- 
+2.34.1
+
